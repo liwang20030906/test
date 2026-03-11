@@ -129,46 +129,158 @@ def create_scatter_plot(df, model, feature='pm25', target='disease_rate'):
 
 # ------------------ 3. AI 交互逻辑 (含模拟模式) ------------------
 
-import json
-import requests
-url = "https://hfn2tdzvcb.coze.site/stream_run"
-headers = {
-  "Authorization": "Bearer <YOUR_TOKEN>",
-  "Content-Type": "application/json",
-  "Accept": "text/event-stream",
-}
-payload = json.loads(r'''{
-  "content": {
-    "query": {
-      "prompt": [
-        {
-          "type": "text",
-          "content": {
-            "text": ""
-          }
-        }
-      ]
-    }
-  },
-  "type": "query",
-  "session_id": "T5Po4JTCjmXg_SOGaU6aW",
-  "project_id": "7614406083259482112"
-}''')
-response = requests.post(url, headers=headers, json=payload, stream=True)
-print("status:", response.status_code)
-try:
-  response.raise_for_status()
-except Exception:
-  print(response.text)
-  raise
-for line in response.iter_lines(decode_unicode=True):
-  if line and line.startswith("data:"):
-    data_text = line[5:].strip()
-    try:
-      parsed = json.loads(data_text)
-      print(json.dumps(parsed, ensure_ascii=False, indent=2))
-    except Exception:
-      print(data_text)
+def get_ai_analysis(df, stats_summary, user_query="", mode="researcher", is_auto_insight=False, scenario_data=None):
+    """
+    获取 AI 分析结果。
+    如果未配置 Token，则使用本地模拟逻辑演示效果。
+    """
+    
+    # 准备数据上下文
+    data_sample = df.head().to_markdown(index=False)
+    
+    # 构建场景描述
+    scenario_text = ""
+    if scenario_data:
+        changes = [f"{k} 变化 {v*100:.1f}%" for k, v in scenario_data.items()]
+        scenario_text = f"\n【模拟情景】: 用户假设 {', '.join(changes)}。请基于回归系数推算结果。"
+
+    # 构建 Prompt
+    if is_auto_insight:
+        sys_prompt = f"""
+        你是首席环境数据分析师。
+        任务：阅读统计摘要，主动挖掘价值。
+        输出格式严格如下：
+        [思考过程]
+        - 分析数据显著性 (P值, R²)
+        - 识别异常点或趋势
+        - 构思建议方向
+        [正式回答]
+        1. **核心发现**: ...
+        2. **异常警示**: ...
+        3. **行动建议**: ...
+        {scenario_text}
+        """
+        user_msg = f"统计结果:\n{stats_summary}\n数据预览:\n{data_sample}"
+    else:
+        sys_prompt = f"""
+        你是环境健康专家 (模式:{mode})。
+        请严格按此格式回答：
+        [思考过程]
+        - 拆解用户意图
+        - 结合统计证据 (P值/R²) 验证
+        - 调用领域知识归因
+        [正式回答]
+        - 针对{mode}语气的详细解答
+        {scenario_text}
+        """
+        user_msg = f"背景:\n{stats_summary}\n问题: {user_query}"
+
+    # --- 真实 API 调用逻辑 (如果配置了 Token) ---
+    # --- 真实 API 调用逻辑 (支持流式 SSE) ---
+    if COZE_API_TOKEN != "YOUR_COZE_TOKEN_HERE" and COZE_BOT_ID != "YOUR_BOT_ID_HERE":
+        try:
+            import requests
+            import json
+            
+            headers = {
+                "Authorization": f"Bearer {COZE_API_TOKEN}", 
+                "Content-Type": "application/json"
+            }
+            
+            payload = {
+                "bot_id": COZE_BOT_ID,
+                "user": "streamlit_user",
+                "query": f"{sys_prompt}\n\n{user_msg}",
+                "stream": True  # ⚠️ 关键：必须开启流式模式以匹配 Coze 默认行为
+            }
+            
+            print(f"🚀 正在请求 Coze API (Stream 模式)...")
+            
+            # 发起流式请求
+            resp = requests.post(COZE_API_URL, json=payload, headers=headers, stream=True, timeout=30)
+            resp.raise_for_status() # 检查 HTTP 状态码
+            
+            full_content = ""
+            
+            # 逐行处理 SSE 数据
+            for line in resp.iter_lines():
+                if line:
+                    decoded_line = line.decode('utf-8')
+                    
+                    # 跳过非 data 行 (如 event: message)
+                    if decoded_line.startswith("data:"):
+                        json_str = decoded_line[5:].strip() # 去掉 "data:" 前缀
+                        
+                        # 跳过 [DONE] 标记
+                        if json_str == "[DONE]":
+                            break
+                            
+                        try:
+                            data = json.loads(json_str)
+                            
+                            # 提取 content 字段
+                            # Coze 的流式结构通常在 data.content.answer 中
+                            if 'content' in data and data['content']:
+                                answer_part = data['content'].get('answer', '')
+                                if answer_part:
+                                    full_content += answer_part
+                                    
+                        except json.JSONDecodeError:
+                            continue # 忽略无法解析的行
+            
+            if not full_content:
+                return "AI 返回了空内容，请检查 Bot 配置或提示词。"
+                
+            return full_content
+
+        except Exception as e:
+            st.error(f"🚨 AI 服务连接失败:\n{str(e)}")
+            st.info("💡 提示：已切换到模拟模式。")
+            # 降级返回模拟数据
+            time.sleep(1.5)
+            return "[模拟模式] 由于 API 解析错误，暂时展示模拟回答...\n\n根据统计模型，PM2.5 每增加 10 单位，疾病发病率上升约 0.5%。建议加强空气质量监测。"
+
+    # --- 模拟模式 (用于演示 UI 和逻辑，无需 Key) ---
+    time.sleep(1.5) # 模拟延迟
+    if is_auto_insight:
+        return f"""[思考过程]
+- 检测到 PM2.5 与 {df.columns[-1]} 的 P 值 < 0.01，呈现极强正相关。
+- R² 达到 {np.random.uniform(0.7, 0.9):.2f}，说明模型解释力很强。
+- 数据中存在个别离群点，可能是极端天气导致。
+- 需要结合季节性因素给出建议。
+
+[正式回答]
+1. **核心发现**: 数据显示 PM2.5 浓度每上升 10 单位，疾病发病率平均上升约 2.5%。统计学上极其显著。
+2. **异常警示**: 12 月份的数据点明显偏离回归线，建议核查当月是否有特殊污染事件。
+3. **行动建议**: 
+   - 对政府：建议在 PM2.5 预警阈值上增加动态调整机制。
+   - 对公众：高污染日减少户外剧烈运动，特别是老人与儿童。
+"""
+    else:
+        if scenario_data:
+            # 模拟预测逻辑
+            pm25_change = scenario_data.get('pm25', 0)
+            effect = pm25_change * 2.5 # 假设系数
+            return f"""[思考过程]
+- 用户设定 PM2.5 变化 {pm25_change*100:.1f}%。
+- 基于回归系数 (约 2.5)，估算疾病率变化约为 {effect:.2f}%。
+- 这是一个显著的改善/恶化趋势。
+
+[正式回答]
+根据您的模拟设定，如果 PM2.5 降低 {abs(pm25_change)*100:.1f}%，预计疾病发病率将下降约 {abs(effect):.2f}%。
+这意味着每年可能减少数百例相关病例，具有巨大的公共卫生价值。建议将此目标纳入年度环保考核。
+"""
+        else:
+            return f"""[思考过程]
+- 用户询问了关于 {user_query[:10]}... 的问题。
+- 结合之前的强相关性结论，这主要归因于颗粒物吸入。
+- 需要从预防角度回答。
+
+[正式回答]
+根据我们的模型分析，{user_query} 确实与空气质量密切相关。
+主要机制是细颗粒物 (PM2.5) 可穿透肺泡进入血液循环，引发系统性炎症。
+建议您关注每日空气质量指数 (AQI)，并在污染天采取防护措施。
+"""
 
 # ------------------ 4. PDF 生成逻辑 ------------------
 
@@ -415,4 +527,3 @@ else:
         demo_df['disease_rate'] = demo_df['disease_rate'].clip(0)
         csv = demo_df.to_csv(index=False).encode('utf-8-sig')
         st.download_button("📥 下载示例 CSV", csv, "demo_data.csv", "text/csv")
-
