@@ -129,116 +129,11 @@ def create_scatter_plot(df, model, feature='pm25', target='disease_rate'):
 
 # ------------------ 3. AI 交互逻辑 (含模拟模式) ------------------
 
-def get_ai_analysis(df, stats_summary, user_query="", mode="researcher", is_auto_insight=False, scenario_data=None):
-    """
-    获取 AI 分析结果。
-    如果未配置 Token，则使用本地模拟逻辑演示效果。
-    """
-    
-    # 准备数据上下文
-    data_sample = df.head().to_markdown(index=False)
-    
-    # 构建场景描述
-    scenario_text = ""
-    if scenario_data:
-        changes = [f"{k} 变化 {v*100:.1f}%" for k, v in scenario_data.items()]
-        scenario_text = f"\n【模拟情景】: 用户假设 {', '.join(changes)}。请基于回归系数推算结果。"
+        return "[模拟模式] 未配置有效 Token。\n根据数据，PM2.5 与发病率呈正相关..."
 
-    # 构建 Prompt
+    # --- 模拟模式 (用于演示 UI 和逻辑，无需 Key) ---
+    time.sleep(1.5) # 模拟延迟
     if is_auto_insight:
-        sys_prompt = f"""
-        你是首席环境数据分析师。
-        任务：阅读统计摘要，主动挖掘价值。
-        输出格式严格如下：
-        [思考过程]
-        - 分析数据显著性 (P值, R²)
-        - 识别异常点或趋势
-        - 构思建议方向
-        [正式回答]
-        1. **核心发现**: ...
-        2. **异常警示**: ...
-        3. **行动建议**: ...
-        {scenario_text}
-        """
-        user_msg = f"统计结果:\n{stats_summary}\n数据预览:\n{data_sample}"
-    else:
-        sys_prompt = f"""
-        你是环境健康专家 (模式:{mode})。
-        请严格按此格式回答：
-        [思考过程]
-        - 拆解用户意图
-        - 结合统计证据 (P值/R²) 验证
-        - 调用领域知识归因
-        [正式回答]
-        - 针对{mode}语气的详细解答
-        {scenario_text}
-        """
-        user_msg = f"背景:\n{stats_summary}\n问题: {user_query}"
-
-    # --- 真实 API 调用逻辑 (如果配置了 Token) ---
-    # --- 真实 API 调用逻辑 (支持流式 SSE) ---
-    if COZE_API_TOKEN != "YOUR_COZE_TOKEN_HERE" and COZE_BOT_ID != "YOUR_BOT_ID_HERE":
-        try:
-            import requests
-            import json
-            
-            headers = {
-                "Authorization": f"Bearer {COZE_API_TOKEN}", 
-                "Content-Type": "application/json"
-            }
-            
-            payload = {
-                "bot_id": COZE_BOT_ID,
-                "user": "streamlit_user",
-                "query": f"{sys_prompt}\n\n{user_msg}",
-                "stream": True  # ⚠️ 关键：必须开启流式模式以匹配 Coze 默认行为
-            }
-            
-            print(f"🚀 正在请求 Coze API (Stream 模式)...")
-            
-            # 发起流式请求
-            resp = requests.post(COZE_API_URL, json=payload, headers=headers, stream=True, timeout=30)
-            resp.raise_for_status() # 检查 HTTP 状态码
-            
-            full_content = ""
-            
-            # 逐行处理 SSE 数据
-            for line in resp.iter_lines():
-                if line:
-                    decoded_line = line.decode('utf-8')
-                    
-                    # 跳过非 data 行 (如 event: message)
-                    if decoded_line.startswith("data:"):
-                        json_str = decoded_line[5:].strip() # 去掉 "data:" 前缀
-                        
-                        # 跳过 [DONE] 标记
-                        if json_str == "[DONE]":
-                            break
-                            
-                        try:
-                            data = json.loads(json_str)
-                            
-                            # 提取 content 字段
-                            # Coze 的流式结构通常在 data.content.answer 中
-                            if 'content' in data and data['content']:
-                                answer_part = data['content'].get('answer', '')
-                                if answer_part:
-                                    full_content += answer_part
-                                    
-                        except json.JSONDecodeError:
-                            continue # 忽略无法解析的行
-            
-            if not full_content:
-                return "AI 返回了空内容，请检查 Bot 配置或提示词。"
-                
-            return full_content
-
-        except Exception as e:
-            st.error(f"🚨 AI 服务连接失败:\n{str(e)}")
-            st.info("💡 提示：已切换到模拟模式。")
-            # 降级返回模拟数据
-            time.sleep(1.5)
-            return "[模拟模式] 由于 API 解析错误，暂时展示模拟回答...\n\n根据统计模型，PM2.5 每增加 10 单位，疾病发病率上升约 0.5%。建议加强空气质量监测。"
 
     # --- 模拟模式 (用于演示 UI 和逻辑，无需 Key) ---
     time.sleep(1.5) # 模拟延迟
@@ -526,4 +421,5 @@ else:
         })
         demo_df['disease_rate'] = demo_df['disease_rate'].clip(0)
         csv = demo_df.to_csv(index=False).encode('utf-8-sig')
+
         st.download_button("📥 下载示例 CSV", csv, "demo_data.csv", "text/csv")
