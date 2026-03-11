@@ -129,53 +129,180 @@ def create_scatter_plot(df, model, feature='pm25', target='disease_rate'):
 
 # ------------------ 3. AI 交互逻辑 (含模拟模式) ------------------
 
-        return "[模拟模式] 未配置有效 Token。\n根据数据，PM2.5 与发病率呈正相关..."
+import streamlit as st
+import requests
+import json
+import time
 
-    # --- 模拟模式 (用于演示 UI 和逻辑，无需 Key) ---
-    time.sleep(1.5) # 模拟延迟
-    if is_auto_insight:
-
-    # --- 模拟模式 (用于演示 UI 和逻辑，无需 Key) ---
-    time.sleep(1.5) # 模拟延迟
-    if is_auto_insight:
-        return f"""[思考过程]
-- 检测到 PM2.5 与 {df.columns[-1]} 的 P 值 < 0.01，呈现极强正相关。
-- R² 达到 {np.random.uniform(0.7, 0.9):.2f}，说明模型解释力很强。
-- 数据中存在个别离群点，可能是极端天气导致。
-- 需要结合季节性因素给出建议。
-
-[正式回答]
-1. **核心发现**: 数据显示 PM2.5 浓度每上升 10 单位，疾病发病率平均上升约 2.5%。统计学上极其显著。
-2. **异常警示**: 12 月份的数据点明显偏离回归线，建议核查当月是否有特殊污染事件。
-3. **行动建议**: 
-   - 对政府：建议在 PM2.5 预警阈值上增加动态调整机制。
-   - 对公众：高污染日减少户外剧烈运动，特别是老人与儿童。
-"""
+def get_ai_analysis(df, stats_summary, user_query="", mode="researcher", is_auto_insight=False, scenario_data=None):
+    """
+    获取 AI 分析结果 (完整版：支持 Coze 流式响应 + 会话上下文保持)
+    """
+    
+    # 1. 准备数据上下文
+    # 防止 df 为空报错
+    if df is None or df.empty:
+        data_sample = "暂无数据预览"
     else:
-        if scenario_data:
-            # 模拟预测逻辑
-            pm25_change = scenario_data.get('pm25', 0)
-            effect = pm25_change * 2.5 # 假设系数
-            return f"""[思考过程]
-- 用户设定 PM2.5 变化 {pm25_change*100:.1f}%。
-- 基于回归系数 (约 2.5)，估算疾病率变化约为 {effect:.2f}%。
-- 这是一个显著的改善/恶化趋势。
+        data_sample = df.head().to_markdown(index=False)
+    
+    # 2. 构建场景描述
+    scenario_text = ""
+    if scenario_data:
+        try:
+            changes = [f"{k} 变化 {v*100:.1f}%" for k, v in scenario_data.items()]
+            scenario_text = f"\n【模拟情景】: 用户假设 {', '.join(changes)}。请基于回归系数推算结果。"
+        except Exception:
+            scenario_text = "\n【模拟情景】: 用户提供了情景数据，请结合分析。"
 
+    # 3. 构建最终 Prompt (将 System Instruction 与 User Data 合并)
+    # 注意：Coze API 的 query 字段通常承载所有输入信息。
+    # 如果你的 Coze Bot 在网页端已经配置了非常完善的“人设”，这里的 instruction 可以简化，
+    # 但为了控制输出格式，我们依然在此处强约束。
+    
+    if is_auto_insight:
+        instruction = f"""你是首席环境数据分析师。
+任务：阅读统计摘要，主动挖掘价值。
+输出格式严格如下：
+[思考过程]
+- 分析数据显著性 (P值，R²)
+- 识别异常点或趋势
+- 构思建议方向
 [正式回答]
-根据您的模拟设定，如果 PM2.5 降低 {abs(pm25_change)*100:.1f}%，预计疾病发病率将下降约 {abs(effect):.2f}%。
-这意味着每年可能减少数百例相关病例，具有巨大的公共卫生价值。建议将此目标纳入年度环保考核。
+1. **核心发现**: ...
+2. **异常警示**: ...
+3. **行动建议**: ...
+{scenario_text}
 """
-        else:
-            return f"""[思考过程]
-- 用户询问了关于 {user_query[:10]}... 的问题。
-- 结合之前的强相关性结论，这主要归因于颗粒物吸入。
-- 需要从预防角度回答。
+        final_query = f"{instruction}\n\n统计结果:\n{stats_summary}\n数据预览:\n{data_sample}"
+    else:
+        instruction = f"""你是环境健康专家 (模式:{mode})。
+请严格按此格式回答：
+[思考过程]
+- 拆解用户意图
+- 结合统计证据 (P值/R²) 验证
+- 调用领域知识归因
+[正式回答]
+- 针对{mode}语气的详细解答
+{scenario_text}
+"""
+        final_query = f"{instruction}\n\n背景:\n{stats_summary}\n用户问题: {user_query}"
 
-[正式回答]
-根据我们的模型分析，{user_query} 确实与空气质量密切相关。
-主要机制是细颗粒物 (PM2.5) 可穿透肺泡进入血液循环，引发系统性炎症。
-建议您关注每日空气质量指数 (AQI)，并在污染天采取防护措施。
-"""
+    # --- 检查是否配置了真实的 API ---
+    # 请确保在全局变量中定义了 COZE_API_TOKEN, COZE_BOT_ID, COZE_API_URL
+    if 'COZE_API_TOKEN' not in globals() or 'COZE_BOT_ID' not in globals() or \
+       COZE_API_TOKEN == "YOUR_COZE_TOKEN_HERE" or COZE_BOT_ID == "YOUR_BOT_ID_HERE":
+        
+        # 模拟模式 (未配置 Token 时)
+        time.sleep(1.5)
+        return "[模拟模式] 尚未配置有效的 Coze Token。\n\n根据当前统计数据，模型显示存在显著相关性。建议进一步检查数据源质量并加强监测。"
+
+    # --- 真实 API 调用逻辑 ---
+    
+    # 🔥 关键修复 1: 管理 Conversation ID (维持多轮对话)
+    if "coze_conversation_id" not in st.session_state:
+        st.session_state.coze_conversation_id = None
+
+    try:
+        headers = {
+            "Authorization": f"Bearer {COZE_API_TOKEN}", 
+            "Content-Type": "application/json"
+        }
+        
+        payload = {
+            "bot_id": COZE_BOT_ID,
+            "user": "streamlit_user", # 可改为动态用户ID
+            "query": final_query,
+            "stream": True
+        }
+        
+        # 如果有会话 ID，则传入以延续上下文
+        if st.session_state.coze_conversation_id:
+            payload["conversation_id"] = st.session_state.coze_conversation_id
+
+        print(f"🚀 正在请求 Coze API (Stream 模式)...")
+        
+        # 🔥 关键修复 2: 增加超时时间 (60秒)，防止复杂工作流被切断
+        resp = requests.post(COZE_API_URL, json=payload, headers=headers, stream=True, timeout=60)
+        resp.raise_for_status()
+        
+        full_content = ""
+        message_placeholder = st.empty()
+        message_placeholder.markdown("💭 **AI 正在深度思考并生成分析报告...**")
+        
+        # 🔥 关键修复 3: 健壮的 SSE 解析逻辑
+        for line in resp.iter_lines():
+            if line:
+                decoded_line = line.decode('utf-8')
+                
+                # 跳过非 data 行
+                if not decoded_line.startswith("data:"):
+                    continue
+                
+                json_str = decoded_line[5:].strip()
+                
+                if json_str == "[DONE]":
+                    break
+                
+                try:
+                    data = json.loads(json_str)
+                    
+                    content_part = ""
+                    
+                    # 兼容 Coze 不同的返回结构
+                    # 结构 A: {"event": "message", "data": {"content": "...", "type": "answer"}}
+                    if "data" in data and isinstance(data["data"], dict):
+                        inner_data = data["data"]
+                        if "content" in inner_data:
+                            content_part = inner_data["content"]
+                        elif "answer" in inner_data: # 旧版本兼容
+                            content_part = inner_data["answer"]
+                    
+                    # 结构 B: {"content": "..."} (扁平化)
+                    elif "content" in data:
+                        content_part = data["content"]
+                        
+                    # 结构 C: 包含 error 信息
+                    if "error" in data:
+                        st.error(f"Coze API 报错: {data['error']}")
+                        break
+
+                    if content_part:
+                        full_content += content_part
+                        # 实时更新界面，让用户看到字在蹦出来
+                        message_placeholder.markdown(full_content)
+                        
+                    # 🔥 关键修复 4: 尝试捕获 conversation_id (如果是新对话)
+                    # Coze 通常在第一个包或特定 event 中返回新的 conversation_id
+                    if not st.session_state.coze_conversation_id:
+                        if "conversation_id" in data:
+                            st.session_state.coze_conversation_id = data["conversation_id"]
+                        elif "data" in data and isinstance(data["data"], dict) and "conversation_id" in data["data"]:
+                            st.session_state.coze_conversation_id = data["data"]["conversation_id"]
+
+                except json.JSONDecodeError:
+                    continue
+                except Exception as e:
+                    print(f"解析行出错: {e}")
+                    continue
+        
+        if not full_content:
+            return "⚠️ AI 返回了空内容。请检查 Coze Bot 是否已发布，或提示词是否触发了安全拦截。"
+            
+        return full_content
+
+    except requests.exceptions.Timeout:
+        st.error("⏰ 请求超时！Coze Bot 处理时间超过 60 秒。可能是工作流太复杂、插件卡顿或网络波动。")
+        return "请求超时，请尝试简化问题或稍后重试。"
+        
+    except requests.exceptions.RequestException as e:
+        error_msg = str(e)
+        st.error(f"🚨 网络连接失败:\n{error_msg}")
+        return f"连接 Coze 服务失败：{error_msg}。\n已自动切换至模拟模式演示。"
+        
+    except Exception as e:
+        st.error(f"🚨 发生未知错误:\n{str(e)}")
+        return "系统内部错误，请稍后再试。"
 
 # ------------------ 4. PDF 生成逻辑 ------------------
 
@@ -421,5 +548,4 @@ else:
         })
         demo_df['disease_rate'] = demo_df['disease_rate'].clip(0)
         csv = demo_df.to_csv(index=False).encode('utf-8-sig')
-
         st.download_button("📥 下载示例 CSV", csv, "demo_data.csv", "text/csv")
