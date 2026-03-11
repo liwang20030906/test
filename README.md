@@ -1,1 +1,9 @@
 # test
+streamlit
+pandas
+numpy
+matplotlib
+statsmodels
+reportlab
+requests
+python-dotenv
