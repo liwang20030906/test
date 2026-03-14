@@ -24,6 +24,10 @@ from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.lib.utils import ImageReader
 
+# Matplotlib 中文字体配置
+plt.rcParams['font.sans-serif'] = ['SimHei', 'Microsoft YaHei', 'Arial Unicode MS', 'DejaVu Sans', 'Arial']
+plt.rcParams['axes.unicode_minus'] = False  # 解决负号显示问题
+
 # 加载 .env 文件中的环境变量
 load_dotenv()
 
@@ -138,27 +142,45 @@ def run_ols_regression(df, target, features):
     model = sm.OLS(y, X).fit()
     return model, model.summary().as_text()
 
+
+
 def create_scatter_plot(df, model, feature='pm25', target='disease_rate'):
-    """生成散点图与回归线"""
-    fig, ax = plt.subplots(figsize=(8, 6))
+    """生成散点图与回归线（支持中英文 + 数学符号）"""
+    fig, ax = plt.subplots(figsize=(8, 6), dpi=150)
     
-    ax.scatter(df[feature], df[target], color='#3498db', alpha=0.6, label='观测数据')
+    # 🔍 关键修复：使用 Matplotlib 数学文本显示 R²
+    try:
+        r_squared = model.rsquared
+        # 使用 $R^2$ 数学文本格式，自动渲染上标
+        fit_label = f'回归拟合 ($R^2$={r_squared:.2f})'
+    except Exception as e:
+        print(f"⚠️ R² 获取失败：{e}")
+        fit_label = '回归拟合线'
     
+    # 绘制散点
+    ax.scatter(df[feature], df[target], color='#3498db', alpha=0.6, 
+               label='观测数据', s=80, edgecolors='white', linewidth=0.5)
+    
+    # 绘制回归线
     if feature in model.params.index:
         slope = model.params[feature]
         intercept = model.params['const']
         x_line = np.linspace(df[feature].min(), df[feature].max(), 100)
         y_line = slope * x_line + intercept
-        ax.plot(x_line, y_line, color='#e74c3c', linewidth=2, label=f'回归拟合 (R²={model.rsquared:.2f})')
+        ax.plot(x_line, y_line, color='#e74c3c', linewidth=2.5, label=fit_label)
     
-    ax.set_xlabel(feature.upper())
-    ax.set_ylabel(target.upper())
-    ax.set_title(f'{feature} vs {target} Analysis')
-    ax.legend()
-    ax.grid(True, linestyle='--', alpha=0.7)
+    # 坐标轴标签
+    ax.set_xlabel('PM2.5 Concentration (μg/m³)', fontsize=11, fontweight='bold')
+    ax.set_ylabel('Disease Rate (%)', fontsize=11, fontweight='bold')
+    ax.set_title('PM2.5 vs Disease Rate Analysis', fontsize=13, fontweight='bold', pad=15)
     
+    # 图例
+    ax.legend(loc='best', fontsize=10, framealpha=0.95, edgecolor='gray')
+    ax.grid(True, linestyle='--', alpha=0.7, linewidth=0.8)
+    
+    # 保存图表
     buf = io.BytesIO()
-    plt.savefig(buf, format='png', dpi=150, bbox_inches='tight')
+    plt.savefig(buf, format='png', dpi=150, bbox_inches='tight', facecolor='white')
     plt.close(fig)
     buf.seek(0)
     return buf.getvalue()
