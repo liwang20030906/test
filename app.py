@@ -24,9 +24,10 @@ from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.lib.utils import ImageReader
 
-# Matplotlib 中文字体配置
-plt.rcParams['font.sans-serif'] = ['SimHei', 'Microsoft YaHei', 'Arial Unicode MS', 'DejaVu Sans', 'Arial']
-plt.rcParams['axes.unicode_minus'] = False  # 解决负号显示问题
+# 英文环境字体配置（Streamlit Cloud 兼容）
+plt.rcParams['font.sans-serif'] = ['DejaVu Sans', 'Arial', 'Liberation Sans']
+plt.rcParams['axes.unicode_minus'] = False
+plt.rcParams['mathtext.fontset'] = 'dejavusans'
 
 # 加载 .env 文件中的环境变量
 load_dotenv()
@@ -145,21 +146,20 @@ def run_ols_regression(df, target, features):
 
 
 def create_scatter_plot(df, model, feature='pm25', target='disease_rate'):
-    """生成散点图与回归线（支持中英文 + 数学符号）"""
+    """生成散点图与回归线（英文版）"""
     fig, ax = plt.subplots(figsize=(8, 6), dpi=150)
     
-    # 🔍 关键修复：使用 Matplotlib 数学文本显示 R²
+    # 获取 R² 值
     try:
         r_squared = model.rsquared
-        # 使用 $R^2$ 数学文本格式，自动渲染上标
-        fit_label = f'回归拟合 ($R^2$={r_squared:.2f})'
+        fit_label = f'Regression Fit ($R^2$={r_squared:.2f})'
     except Exception as e:
         print(f"⚠️ R² 获取失败：{e}")
-        fit_label = '回归拟合线'
+        fit_label = 'Regression Line'
     
     # 绘制散点
     ax.scatter(df[feature], df[target], color='#3498db', alpha=0.6, 
-               label='观测数据', s=80, edgecolors='white', linewidth=0.5)
+               label='Observed Data', s=80, edgecolors='white', linewidth=0.5)
     
     # 绘制回归线
     if feature in model.params.index:
