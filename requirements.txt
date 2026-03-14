@@ -7,4 +7,3 @@ reportlab
 requests
 python-dotenv
 tabulate
-tempfile
