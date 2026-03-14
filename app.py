@@ -4,8 +4,12 @@ import numpy as np
 import io
 import os
 import platform
+import tempfile
 import re
 import time
+import uuid
+import json
+import requests
 from datetime import datetime
 from dotenv import load_dotenv
 
@@ -19,18 +23,55 @@ from reportlab.pdfgen import canvas
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.lib.utils import ImageReader
+
 # 加载 .env 文件中的环境变量
 load_dotenv()
 
-
-COZE_API_TOKEN = os.getenv("COZE_API_TOKEN", "") 
-COZE_BOT_ID = os.getenv("COZE_BOT_ID", "7614406083259482112") 
+COZE_API_TOKEN = os.getenv("COZE_API_TOKEN", "")
+COZE_BOT_ID = os.getenv("COZE_BOT_ID", "7614406083259482112")
 COZE_API_URL = os.getenv("COZE_API_URL", "https://hfn2tdzvcb.coze.site/stream_run")
 
+# ===================== Coze 系统提示词（您设计的） =====================
+COZE_SYSTEM_PROMPT = """
+# 角色定义
+你是一位专业的健康风险评估专家，专注于环境暴露与疾病流行病学研究。你精通统计学方法，包括双向固定效应模型、人群归因分数（PAF）等高级分析技术。
 
-# ===================================================================
+# 任务目标
+你的核心任务是分析环境温度与疾病发病率的关系，为用户提供专业的风险评估和公共卫生政策建议。
 
-# ------------------ 1. 辅助函数：字体与文本处理 ------------------
+# 能力
+1. **数据处理能力**：能够读取和验证用户上传的CSV数据文件，或生成示例数据集
+2. **统计分析能力**：
+   - 运行双向固定效应模型，控制地区和时间效应
+   - 计算人群归因分数（PAF），评估温度暴露对疾病负担的贡献
+   - 识别温度与疾病之间的非线性关系（如U型曲线）
+3. **可视化能力**：生成温度-疾病暴露响应曲线，直观展示风险关系
+4. **专业解读能力**：对统计结果进行专业解读，提供清晰的结论和建议
+5. **政策建议能力**：基于分析结果，提供切实可行的公共卫生政策建议
+
+# 工作流程
+当用户请求分析时，请按以下步骤操作：
+1. **数据准备阶段**：验证数据质量和格式
+2. **统计分析阶段**：运行双向固定效应模型，计算人群归因分数
+3. **可视化阶段**：生成暴露响应曲线
+4. **结果解读阶段**：专业解读统计结果
+5. **政策建议阶段**：提出具体政策建议
+
+# 输出格式要求
+1. 使用 Markdown 格式，结构清晰
+2. 统计结果使用表格呈现（估计值、标准误、t值、p值等）
+3. 图表生成后，提供图片路径
+4. 政策建议使用项目符号列表
+5. 重要结论使用粗体强调
+
+# 注意事项
+1. 保持专业客观，基于数据得出结论
+2. 避免过度解读，区分相关性和因果
+3. 数据不足时诚实告知
+4. 用通俗语言解释专业术语
+"""
+
+# ===================== 辅助函数：字体与文本处理 =====================
 
 def register_chinese_font():
     """自动注册系统中可用的中文字体"""
@@ -45,13 +86,13 @@ def register_chinese_font():
                 r"C:\Windows\Fonts\msyh.ttc",
                 r"C:\Windows\Fonts\simsun.ttc"
             ]
-        elif system == "Darwin": # macOS
+        elif system == "Darwin":  # macOS
             candidates = [
                 "/System/Library/Fonts/PingFang.ttc",
                 "/Library/Fonts/Songti.ttc",
                 "/System/Library/Fonts/STHeiti Light.ttc"
             ]
-        else: # Linux
+        else:  # Linux
             candidates = ["/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc"]
         
         for path in candidates:
@@ -82,11 +123,10 @@ def clean_markdown_text(text):
     text = re.sub(r'\[思考过程\].*?\[正式回答\]', '', text, flags=re.DOTALL)
     return text
 
-# ------------------ 2. 核心逻辑：统计与绘图 ------------------
+# ===================== 核心逻辑：统计与绘图 =====================
 
 def run_ols_regression(df, target, features):
     """运行 OLS 回归模型"""
-    # 确保只包含数值列且无空值
     df_clean = df[features + [target]].dropna()
     if len(df_clean) < 5:
         return None, "数据量不足，无法进行回归分析。"
@@ -102,11 +142,8 @@ def create_scatter_plot(df, model, feature='pm25', target='disease_rate'):
     """生成散点图与回归线"""
     fig, ax = plt.subplots(figsize=(8, 6))
     
-    # 散点
     ax.scatter(df[feature], df[target], color='#3498db', alpha=0.6, label='观测数据')
     
-    # 回归线
-    # 获取模型中该特征的系数
     if feature in model.params.index:
         slope = model.params[feature]
         intercept = model.params['const']
@@ -120,169 +157,318 @@ def create_scatter_plot(df, model, feature='pm25', target='disease_rate'):
     ax.legend()
     ax.grid(True, linestyle='--', alpha=0.7)
     
-    # 保存为字节流
     buf = io.BytesIO()
     plt.savefig(buf, format='png', dpi=150, bbox_inches='tight')
     plt.close(fig)
     buf.seek(0)
     return buf.getvalue()
 
-# ------------------ 3. AI 交互逻辑 (含模拟模式) ------------------
+def format_stats_summary(model, df):
+    """将模型结果格式化为 Markdown 表格，供 Coze 使用"""
+    summary = f"### 数据概览\n- 样本量: {len(df)}\n"
+    
+    # 系数表
+    coef_table = "### 双向固定效应模型结果\n| 变量 | 系数 | 标准误 | t值 | P值 | 95%置信区间 |\n"
+    coef_table += "|------|------|--------|-----|-----|-------------|\n"
+    for var in ['pm25', 'temperature', 'humidity']:
+        if var in model.params:
+            coef = model.params[var]
+            se = model.bse[var]
+            t = model.tvalues[var]
+            p = model.pvalues[var]
+            ci_low, ci_high = model.conf_int().loc[var]
+            coef_table += f"| {var} | {coef:.3f} | {se:.3f} | {t:.3f} | {p:.3f} | [{ci_low:.3f}, {ci_high:.3f}] |\n"
+    
+    coef_table += f"\n**模型拟合**: R² = {model.rsquared:.3f}, 调整R² = {model.rsquared_adj:.3f}\n"
+    return summary + coef_table
 
-def get_ai_analysis(df, stats_summary, user_query="", mode="researcher", is_auto_insight=False, scenario_data=None):
+# ===================== AI 交互逻辑（含本地回退） =====================
+
+def get_ai_analysis(df, model, stats_summary, user_query="", mode="researcher", is_auto_insight=False, scenario_data=None):
     """
     获取 AI 分析结果。
-    如果未配置 Token，则使用本地模拟逻辑演示效果。
+    优先使用 Coze API 真实调用，失败时回退到基于模型数据的模拟分析。
     """
-    
-    # 准备数据上下文
     data_sample = df.head().to_markdown(index=False)
     
-    # 构建场景描述
     scenario_text = ""
     if scenario_data:
         changes = [f"{k} 变化 {v*100:.1f}%" for k, v in scenario_data.items()]
         scenario_text = f"\n【模拟情景】: 用户假设 {', '.join(changes)}。请基于回归系数推算结果。"
-
-    # 构建 Prompt
-    if is_auto_insight:
-        sys_prompt = f"""
-        你是首席环境数据分析师。
-        任务：阅读统计摘要，主动挖掘价值。
-        输出格式严格如下：
-        [思考过程]
-        - 分析数据显著性 (P值, R²)
-        - 识别异常点或趋势
-        - 构思建议方向
-        [正式回答]
-        1. **核心发现**: ...
-        2. **异常警示**: ...
-        3. **行动建议**: ...
-        {scenario_text}
-        """
-        user_msg = f"统计结果:\n{stats_summary}\n数据预览:\n{data_sample}"
+    
+    # 根据模式添加语气指令
+    if mode == "researcher":
+        tone_instruction = "请使用学术语言，引用统计指标（系数、P值、R²等），探讨机制，提出专业建议。"
     else:
-        sys_prompt = f"""
-        你是环境健康专家 (模式:{mode})。
-        请严格按此格式回答：
-        [思考过程]
-        - 拆解用户意图
-        - 结合统计证据 (P值/R²) 验证
-        - 调用领域知识归因
-        [正式回答]
-        - 针对{mode}语气的详细解答
-        {scenario_text}
-        """
-        user_msg = f"背景:\n{stats_summary}\n问题: {user_query}"
-
-    # --- 真实 API 调用逻辑 (如果配置了 Token) ---
-    # --- 真实 API 调用逻辑 (支持流式 SSE) ---
-    if COZE_API_TOKEN != "YOUR_COZE_TOKEN_HERE" and COZE_BOT_ID != "YOUR_BOT_ID_HERE":
-        try:
-            import requests
-            import json
-            
-            headers = {
-                "Authorization": f"Bearer {COZE_API_TOKEN}", 
-                "Content-Type": "application/json"
-            }
-            
-            payload = {
-                "bot_id": COZE_BOT_ID,
-                "user": "streamlit_user",
-                "query": f"{sys_prompt}\n\n{user_msg}",
-                "stream": True  # ⚠️ 关键：必须开启流式模式以匹配 Coze 默认行为
-            }
-            
-            print(f"🚀 正在请求 Coze API (Stream 模式)...")
-            
-            # 发起流式请求
-            resp = requests.post(COZE_API_URL, json=payload, headers=headers, stream=True, timeout=30)
-            resp.raise_for_status() # 检查 HTTP 状态码
-            
-            full_content = ""
-            
-            # 逐行处理 SSE 数据
-            for line in resp.iter_lines():
-                if line:
-                    decoded_line = line.decode('utf-8')
-                    
-                    # 跳过非 data 行 (如 event: message)
-                    if decoded_line.startswith("data:"):
-                        json_str = decoded_line[5:].strip() # 去掉 "data:" 前缀
-                        
-                        # 跳过 [DONE] 标记
-                        if json_str == "[DONE]":
-                            break
-                            
-                        try:
-                            data = json.loads(json_str)
-                            
-                            # 提取 content 字段
-                            # Coze 的流式结构通常在 data.content.answer 中
-                            if 'content' in data and data['content']:
-                                answer_part = data['content'].get('answer', '')
-                                if answer_part:
-                                    full_content += answer_part
-                                    
-                        except json.JSONDecodeError:
-                            continue # 忽略无法解析的行
-            
-            if not full_content:
-                return "AI 返回了空内容，请检查 Bot 配置或提示词。"
-                
-            return full_content
-
-        except Exception as e:
-            st.error(f"🚨 AI 服务连接失败:\n{str(e)}")
-            st.info("💡 提示：已切换到模拟模式。")
-            # 降级返回模拟数据
-            time.sleep(1.5)
-            return "[模拟模式] 由于 API 解析错误，暂时展示模拟回答...\n\n根据统计模型，PM2.5 每增加 10 单位，疾病发病率上升约 0.5%。建议加强空气质量监测。"
-
-    # --- 模拟模式 (用于演示 UI 和逻辑，无需 Key) ---
-    time.sleep(1.5) # 模拟延迟
+        tone_instruction = "请使用通俗易懂的语言，避免专业术语，注重实用建议和日常指导，语气亲切。"
+    
     if is_auto_insight:
-        return f"""[思考过程]
-- 检测到 PM2.5 与 {df.columns[-1]} 的 P 值 < 0.01，呈现极强正相关。
-- R² 达到 {np.random.uniform(0.7, 0.9):.2f}，说明模型解释力很强。
-- 数据中存在个别离群点，可能是极端天气导致。
-- 需要结合季节性因素给出建议。
+        task_instruction = "请根据提供的统计结果和数据预览，进行深度洞察，包括核心发现、异常警示和行动建议。"
+        user_msg = f"统计结果:\n{stats_summary}\n数据预览:\n{data_sample}\n\n{task_instruction}\n{tone_instruction}\n{scenario_text}"
+    else:
+        user_msg = f"背景:\n{stats_summary}\n问题: {user_query}\n\n请按照工作流程分析，并输出专业报告。{tone_instruction}\n{scenario_text}"
+    
+    full_prompt = f"{COZE_SYSTEM_PROMPT}\n\n当前分析请求：\n{user_msg}"
 
-[正式回答]
-1. **核心发现**: 数据显示 PM2.5 浓度每上升 10 单位，疾病发病率平均上升约 2.5%。统计学上极其显著。
-2. **异常警示**: 12 月份的数据点明显偏离回归线，建议核查当月是否有特殊污染事件。
-3. **行动建议**: 
-   - 对政府：建议在 PM2.5 预警阈值上增加动态调整机制。
-   - 对公众：高污染日减少户外剧烈运动，特别是老人与儿童。
-"""
+    # --- 真实 API 调用 ---
+        # --- 真实 API 调用（调试增强版）---
+    # --- 真实 API 调用（修复版）---
+    if COZE_API_TOKEN and COZE_BOT_ID and COZE_API_TOKEN != "YOUR_COZE_TOKEN_HERE":
+        try:
+            headers = {
+                "Authorization": f"Bearer {COZE_API_TOKEN}",
+                "Content-Type": "application/json",
+                "Accept": "text/event-stream",
+            }
+            payload = {
+                "content": {
+                    "query": {
+                        "prompt": [
+                            {
+                                "type": "text",
+                                "content": {
+                                    "text": full_prompt
+                                }
+                            }
+                        ]
+                    }
+                },
+                "type": "query",
+                "session_id": str(uuid.uuid4()),
+                "project_id": COZE_BOT_ID,
+                "stream": True
+            }
+
+            print(f"🚀 正在请求 Coze API...")
+            print(f"   URL: {COZE_API_URL}")
+            print(f"   Bot ID: {COZE_BOT_ID}")
+            
+            response = requests.post(COZE_API_URL, headers=headers, json=payload, stream=True, timeout=60)
+            
+            print(f"📋 响应状态码：{response.status_code}")
+            
+            if response.status_code != 200:
+                print(f"❌ 请求失败！响应内容：{response.text[:500]}")
+                st.error(f"API 返回错误：{response.status_code}")
+                return generate_fallback_analysis(df, model, mode, is_auto_insight, scenario_data, user_query)
+            
+            # 流式处理
+            full_content = ""
+            line_count = 0
+            has_answer = False  # 标记是否收到有效回答
+            
+            for line in response.iter_lines(decode_unicode=True):
+                line_count += 1
+                
+                if line and line.startswith("data:"):
+                    data_str = line[5:].strip()
+                    
+                    if data_str == "[DONE]":
+                        break
+                    
+                    try:
+                        data = json.loads(data_str)
+                        
+                        # 🔍 关键：从嵌套结构中提取 answer
+                        content_obj = data.get('content', {})
+                        if isinstance(content_obj, dict):
+                            answer = content_obj.get('answer', '')
+                            if answer and answer != 'null':
+                                full_content += str(answer)
+                                has_answer = True
+                                #print(f"✨ 收到回答片段 ({len(answer)} 字符)")
+                        
+                        # 备用：直接检查 answer 字段
+                        if not has_answer and 'answer' in data and data['answer']:
+                            full_content += str(data['answer'])
+                            has_answer = True
+                            
+                    except json.JSONDecodeError:
+                        continue
+            
+            print(f"📊 总结：共 {line_count} 行，内容长度 {len(full_content)}，has_answer={has_answer}")
+            
+            if full_content and has_answer:
+                return full_content
+            else:
+                st.warning("⚠️ AI 返回了空内容，使用本地数据分析。")
+                print(f"⚠️ 调试信息：Bot 未返回有效回答，请检查 Bot 配置")
+                return generate_fallback_analysis(df, model, mode, is_auto_insight, scenario_data, user_query)
+
+        except requests.exceptions.Timeout:
+            st.error("🚨 请求超时（>60 秒）")
+            return generate_fallback_analysis(df, model, mode, is_auto_insight, scenario_data, user_query)
+        except Exception as e:
+            st.error(f"🚨 错误：{e}")
+            import traceback
+            traceback.print_exc()
+            return generate_fallback_analysis(df, model, mode, is_auto_insight, scenario_data, user_query)
+    else:
+        return generate_fallback_analysis(df, model, mode, is_auto_insight, scenario_data, user_query)
+
+# ===================== 图片处理函数（新增）=====================
+
+# ===================== 图片处理函数（修复版）=====================
+
+def process_ai_images(ai_content):
+    """
+    处理 AI 返回内容中的图片链接，支持本地路径和远程链接
+    """
+    if not ai_content:
+        return ai_content, []
+    
+    # 查找所有 Markdown 图片链接
+    image_pattern = r'!\[([^\]]*)\]\(([^)]+)\)'
+    matches = re.findall(image_pattern, ai_content)
+    
+    if not matches:
+        return ai_content, []
+    
+    print(f"🖼️ 检测到 {len(matches)} 个图片")
+    
+    downloaded_images = []
+    processed_content = ai_content
+    
+    for alt_text, img_url in matches:
+        try:
+            print(f"   处理：{img_url[:80]}...")
+            
+            # 🎯 关键修复：检测是否是本地路径
+            if img_url.startswith('/') or img_url.startswith('./') or img_url.startswith('../'):
+                # 本地路径，直接检查文件是否存在
+                if os.path.exists(img_url):
+                    print(f"   ✓ 本地文件存在：{img_url}")
+                    downloaded_images.append(img_url)
+                else:
+                    print(f"   ⚠️ 本地文件不存在：{img_url}")
+                    # 尝试从 AI 响应中移除无效图片链接
+                    processed_content = processed_content.replace(f'![{alt_text}]({img_url})', f'[图片：{alt_text}]')
+                continue
+            
+            # 远程链接，通过网络下载
+            headers = {
+                "User-Agent": "Mozilla/5.0",
+                "Referer": "https://www.coze.cn"
+            }
+            
+            response = requests.get(img_url, headers=headers, timeout=30)
+            response.raise_for_status()
+            
+            # 检查是否是图片内容
+            content_type = response.headers.get('Content-Type', '')
+            if 'image' not in content_type:
+                print(f"   ⚠️ 不是图片内容：{content_type}")
+                continue
+            
+            # 确定文件扩展名
+            ext_map = {
+                'image/png': '.png',
+                'image/jpeg': '.jpg',
+                'image/gif': '.gif',
+                'image/webp': '.webp'
+            }
+            file_extension = ext_map.get(content_type, '.png')
+            
+            # 保存到临时文件
+            with tempfile.NamedTemporaryFile(delete=False, suffix=file_extension) as tmp_file:
+                tmp_file.write(response.content)
+                tmp_path = tmp_file.name
+            
+            downloaded_images.append(tmp_path)
+            print(f"   ✓ 已下载：{tmp_path}")
+            
+        except Exception as e:
+            print(f"   ❌ 处理失败：{e}")
+            # 尝试从 AI 响应中移除无效图片链接
+            processed_content = processed_content.replace(f'![{alt_text}]({img_url})', f'[图片：{alt_text}]')
+            continue
+    
+    return processed_content, downloaded_images
+
+
+def display_ai_report(ai_content, downloaded_images):
+    """
+    显示 AI 报告，包含处理后的图片
+    """
+    # 1. 先显示文本内容
+    st.markdown(ai_content)
+    
+    # 2. 单独显示下载的图片（更可靠）
+    if downloaded_images:
+        st.subheader("📊 分析图表")
+        for img_path in downloaded_images:
+            try:
+                # 🎯 关键修复：本地路径和临时文件都支持
+                st.image(img_path, use_container_width=True)
+                
+                # 清理临时文件（仅针对临时文件，不删除本地生成文件）
+                if img_path.startswith('/tmp/tmp'):
+                    try:
+                        os.unlink(img_path)
+                        print(f"   🗑️ 已清理临时文件：{img_path}")
+                    except:
+                        pass
+            except Exception as e:
+                st.error(f"图片显示失败：{e}")
+                print(f"   ❌ 图片显示错误：{e}")
+
+
+def generate_fallback_analysis(df, model, mode, is_auto_insight, scenario_data, user_query=""):
+    """基于真实模型结果生成分析，并根据 mode 区分语气"""
+    if model is None:
+        return "无法生成分析，模型不可用。"
+    
+    coef_pm25 = model.params.get('pm25', 0)
+    pval_pm25 = model.pvalues.get('pm25', 1)
+    r2 = model.rsquared
+    coef_temp = model.params.get('temperature', 0)
+    coef_hum = model.params.get('humidity', 0)
+    
+    thought = f"[思考过程]\n"
+    thought += f"- PM2.5 系数 = {coef_pm25:.3f} (P={pval_pm25:.3f})\n"
+    thought += f"- 温度系数 = {coef_temp:.3f}, 湿度系数 = {coef_hum:.3f}\n"
+    thought += f"- 模型 R² = {r2:.3f}\n"
+    
+    if is_auto_insight:
+        if pval_pm25 < 0.05:
+            thought += f"- PM2.5 对疾病率有显著影响 (P<0.05)\n"
+        else:
+            thought += f"- PM2.5 影响不显著，需关注其他因素\n"
+        thought += "- 识别异常点趋势...\n"
+        
+        if mode == "researcher":
+            answer = f"[正式回答]\n"
+            answer += f"1. **核心发现**：PM2.5 每增加 1 单位，疾病率变化 {coef_pm25:.3f} 单位 (P={pval_pm25:.3f})，模型解释力 R²={r2:.2f}。\n"
+            answer += f"2. **异常警示**：建议检查高杠杆点（如极端天气日）对模型的影响。\n"
+            answer += f"3. **行动建议**：建议加强工业排放管控，并开展季节性健康预警。"
+        else:
+            answer = f"[正式回答]\n"
+            answer += f"1. **核心发现**：空气污染越重，生病的人可能越多。数据显示 PM2.5 每升高一点，发病率大约变化 {abs(coef_pm25):.2f}。\n"
+            answer += f"2. **异常提醒**：某些天气异常的日子数据偏离较大，要多加留意。\n"
+            answer += f"3. **日常建议**：污染天记得戴口罩、减少户外活动，特别是老人和小孩。"
     else:
         if scenario_data:
-            # 模拟预测逻辑
             pm25_change = scenario_data.get('pm25', 0)
-            effect = pm25_change * 2.5 # 假设系数
-            return f"""[思考过程]
-- 用户设定 PM2.5 变化 {pm25_change*100:.1f}%。
-- 基于回归系数 (约 2.5)，估算疾病率变化约为 {effect:.2f}%。
-- 这是一个显著的改善/恶化趋势。
-
-[正式回答]
-根据您的模拟设定，如果 PM2.5 降低 {abs(pm25_change)*100:.1f}%，预计疾病发病率将下降约 {abs(effect):.2f}%。
-这意味着每年可能减少数百例相关病例，具有巨大的公共卫生价值。建议将此目标纳入年度环保考核。
-"""
+            effect = pm25_change * coef_pm25 * 100
+            thought += f"- 用户设定 PM2.5 变化 {pm25_change*100:.1f}%\n"
+            thought += f"- 基于回归系数 {coef_pm25:.3f}，估算疾病率变化 {effect:.2f}%\n"
+            
+            if mode == "researcher":
+                answer = f"[正式回答]\n根据模型推算，如果 PM2.5 {'降低' if pm25_change<0 else '升高'} {abs(pm25_change)*100:.1f}%，预计疾病发病率将 {'下降' if effect<0 else '上升'} {abs(effect):.2f}%（基于系数 {coef_pm25:.3f}）。这一变化具有显著的公共卫生意义。"
+            else:
+                answer = f"[正式回答]\n如果 PM2.5 {'降低' if pm25_change<0 else '升高'} {abs(pm25_change)*100:.1f}%，生病的人预计会 {'减少' if effect<0 else '增加'} 大约 {abs(effect):.1f}%。所以改善空气质量真的很重要！"
         else:
-            return f"""[思考过程]
-- 用户询问了关于 {user_query[:10]}... 的问题。
-- 结合之前的强相关性结论，这主要归因于颗粒物吸入。
-- 需要从预防角度回答。
+            thought += f"- 用户询问：{user_query}\n"
+            thought += f"- 基于现有模型，PM2.5 是主要影响因素。\n"
+            
+            if mode == "researcher":
+                answer = f"[正式回答]\n根据模型分析，{user_query} 与空气质量密切相关。PM2.5 通过氧化应激引发炎症，建议关注长期暴露风险。"
+            else:
+                answer = f"[正式回答]\n{user_query} 确实和空气污染有关。平时可以看看空气质量预报，污染天戴口罩、用空气净化器。"
+    
+    return thought + "\n" + answer
 
-[正式回答]
-根据我们的模型分析，{user_query} 确实与空气质量密切相关。
-主要机制是细颗粒物 (PM2.5) 可穿透肺泡进入血液循环，引发系统性炎症。
-建议您关注每日空气质量指数 (AQI)，并在污染天采取防护措施。
-"""
-
-# ------------------ 4. PDF 生成逻辑 ------------------
+# ===================== PDF 生成逻辑 =====================
 
 def generate_pdf_report(model_summary, ai_response, chart_img_bytes, mode):
     buffer = io.BytesIO()
@@ -291,7 +477,6 @@ def generate_pdf_report(model_summary, ai_response, chart_img_bytes, mode):
     
     chinese_font = register_chinese_font()
     
-    # 标题
     c.setFont("Helvetica-Bold", 18)
     c.drawString(50, height - 50, "EnvInsight AI Analysis Report")
     
@@ -305,7 +490,7 @@ def generate_pdf_report(model_summary, ai_response, chart_img_bytes, mode):
     c.drawString(50, height - 110, "1. 统计建模结论")
     c.setFont(chinese_font, 9)
     text_object = c.beginText(50, height - 130)
-    for line in model_summary.split('\n')[:15]: # 只取前15行避免溢出
+    for line in model_summary.split('\n')[:15]:
         text_object.textLine(line)
     c.drawText(text_object)
     
@@ -324,7 +509,6 @@ def generate_pdf_report(model_summary, ai_response, chart_img_bytes, mode):
     c.setFont(chinese_font, 14)
     c.drawString(50, current_y, "3. AI 专家深度解读")
     
-    # 清理 Markdown 和思维链标记
     clean_text = clean_markdown_text(ai_response)
     
     c.setFont(chinese_font, 10)
@@ -338,7 +522,6 @@ def generate_pdf_report(model_summary, ai_response, chart_img_bytes, mode):
             c.setFont(chinese_font, 10)
             c.drawString(50, height - 30, f"EnvInsight Report - Page {c.getPageNumber()}")
         
-        # 简单换行处理
         if c.stringWidth(line, chinese_font, 10) > width - 100:
             max_chars = 35
             for i in range(0, len(line), max_chars):
@@ -355,7 +538,7 @@ def generate_pdf_report(model_summary, ai_response, chart_img_bytes, mode):
     buffer.seek(0)
     return buffer
 
-# ------------------ 5. Streamlit 主界面 ------------------
+# ===================== Streamlit 主界面 =====================
 
 st.set_page_config(page_title="EnvInsight AI Pro", layout="wide", page_icon="🌍")
 
@@ -364,40 +547,36 @@ st.markdown("""
 > 融合 **严谨统计建模 (OLS)** 与 **大语言模型推理**，提供从数据上传、归因分析、情景模拟到报告生成的全流程 AI 解决方案。
 """)
 
-# 侧边栏
 with st.sidebar:
     st.header("⚙️ 控制面板")
     uploaded_file = st.file_uploader("上传数据 (.csv)", type=['csv'])
     st.divider()
-    mode = st.selectbox("分析模式", ["researcher", "public"], format_func=lambda x: "🔬 科研专家模式" if x == "researcher" else "👥 大众科普模式")
-    
+    mode = st.selectbox("分析模式", ["researcher", "public"], 
+                        format_func=lambda x: "🔬 科研专家模式" if x == "researcher" else "👥 大众科普模式")
     st.divider()
     st.info("💡 **AI 增强功能已启用**:\n- 自动深度洞察\n- 思维链展示 (CoT)\n- What-If 政策模拟")
 
 if uploaded_file:
-    # 读取数据
     try:
         df = pd.read_csv(uploaded_file)
-        # 简单的列名映射假设 (实际项目中可做更灵活的映射)
-        # 假设用户上传的列包含 'pm25', 'temperature', 'humidity', 'disease_rate'
-        # 如果列名不同，这里做个简单提示或自动匹配
         required_cols = ['pm25', 'temperature', 'humidity', 'disease_rate']
         if not all(col in df.columns for col in required_cols):
             st.error(f"❌ 数据缺少必要列。请确保 CSV 包含: {', '.join(required_cols)}")
             st.stop()
-            
+        
         df = df[required_cols]
         
-        # 展示原始数据
         with st.expander("📊 查看原始数据"):
             st.dataframe(df)
-            
-        # 1. 运行统计模型
+        
         features = ['temperature', 'pm25', 'humidity']
         target = 'disease_rate'
         model, summary_text = run_ols_regression(df, target, features)
         
         if model:
+            # 生成格式化的统计摘要供 AI 使用
+            formatted_stats = format_stats_summary(model, df)
+            
             col1, col2 = st.columns([2, 1])
             with col1:
                 st.subheader("📈 可视化分析")
@@ -406,33 +585,34 @@ if uploaded_file:
             
             with col2:
                 st.subheader("📝 统计摘要")
-                st.text(summary_text[:500] + "...") # 简略显示
+                st.text(summary_text[:500] + "...")
             
             st.divider()
             
-            # 2. ✨ AI 自动深度洞察 (页面加载即触发)
+            # 自动深度洞察（传入 model）
             st.subheader("🧠 AI 自动深度洞察")
             with st.spinner("AI 正在分析数据特征、计算归因并生成策略..."):
-                auto_insight = get_ai_analysis(df, summary_text, mode=mode, is_auto_insight=True)
+                auto_insight = get_ai_analysis(df, model, formatted_stats, mode=mode, is_auto_insight=True)
                 
-                # 解析思维链
-                thought = ""
-                answer = ""
-                if "[思考过程]" in auto_insight and "[正式回答]" in auto_insight:
-                    parts = auto_insight.split("[正式回答]")
+                # 🖼️ 处理图片
+                processed_content, images = process_ai_images(auto_insight)
+                
+                if "[思考过程]" in processed_content and "[正式回答]" in processed_content:
+                    parts = processed_content.split("[正式回答]")
                     thought = parts[0].replace("[思考过程]", "").strip()
                     answer = parts[1].strip()
                     
                     with st.expander("👁️ 点击查看 AI 推理逻辑 (Chain of Thought)"):
                         st.markdown(thought.replace("\n", "\n\n"))
                     st.success("✅ 分析完成")
-                    st.markdown(answer)
+                    # 使用新函数显示报告（包含图片）
+                    display_ai_report(answer, images)
                 else:
-                    st.markdown(auto_insight)
+                    display_ai_report(processed_content, images)
             
             st.divider()
             
-            # 3. ✨ What-If 政策模拟器
+            # 政策模拟器
             st.subheader("🔮 政策模拟器 (What-If Analysis)")
             st.caption("调整滑块，模拟环境指标变化对疾病率的潜在影响。")
             
@@ -452,19 +632,22 @@ if uploaded_file:
                         'humidity': hum_sim / 100.0
                     }
                     query = f"如果 PM2.5 变化 {pm25_sim}%, 温度 {temp_sim}%, 湿度 {hum_sim}%?"
-                    scenario_resp = get_ai_analysis(df, summary_text, user_query=query, mode=mode, scenario_data=scenario_data)
+                    scenario_resp = get_ai_analysis(df, model, formatted_stats, user_query=query, mode=mode, scenario_data=scenario_data)
                     
-                    if "[思考过程]" in scenario_resp:
-                        parts = scenario_resp.split("[正式回答]")
+                    # 🖼️ 处理图片
+                    processed_content, images = process_ai_images(scenario_resp)
+                    
+                    if "[思考过程]" in processed_content:
+                        parts = processed_content.split("[正式回答]")
                         with st.expander("🤖 推演逻辑"):
                             st.write(parts[0].replace("[思考过程]", ""))
-                        st.info(parts[1])
+                        display_ai_report(parts[1], images)
                     else:
-                        st.info(scenario_resp)
+                        display_ai_report(processed_content, images)
             
             st.divider()
             
-            # 4. 多轮对话
+            # 多轮对话
             st.subheader("💬 与 AI 分析师对话")
             if "messages" not in st.session_state:
                 st.session_state.messages = []
@@ -480,26 +663,25 @@ if uploaded_file:
                 
                 with st.chat_message("assistant"):
                     with st.spinner("思考中..."):
-                        response = get_ai_analysis(df, summary_text, user_query=prompt, mode=mode)
-                        # 前端展示时也可以剥离思维链，只显示正式回答，或者保留
-                        if "[正式回答]" in response:
-                            final_display = response.split("[正式回答]")[1].strip()
-                            # 可选：在 expander 里放思维链
+                        response = get_ai_analysis(df, model, formatted_stats, user_query=prompt, mode=mode)
+                        
+                        # 🖼️ 处理图片
+                        processed_content, images = process_ai_images(response)
+                        
+                        if "[正式回答]" in processed_content:
+                            final_display = processed_content.split("[正式回答]")[1].strip()
                             with st.expander("查看思考过程"):
-                                st.write(response.split("[正式回答]")[0])
-                            st.markdown(final_display)
+                                st.write(processed_content.split("[正式回答]")[0])
+                            display_ai_report(final_display, images)
                             st.session_state.messages.append({"role": "assistant", "content": final_display})
                         else:
-                            st.markdown(response)
-                            st.session_state.messages.append({"role": "assistant", "content": response})
+                            display_ai_report(processed_content, images)
+                            st.session_state.messages.append({"role": "assistant", "content": processed_content})
             
-            # 5. PDF 导出
+            # PDF 导出
             st.divider()
             if st.button("📥 下载完整分析报告 (PDF)"):
-                # 收集所有 AI 回答用于 PDF (这里简化为只放入最后的自动洞察或对话历史)
-                # 实际项目中可以拼接所有对话
-                pdf_content = auto_insight 
-                pdf_buf = generate_pdf_report(summary_text, pdf_content, chart_bytes, mode)
+                pdf_buf = generate_pdf_report(summary_text, auto_insight, chart_bytes, mode)
                 st.download_button(
                     label="点击下载 PDF",
                     data=pdf_buf,
@@ -514,7 +696,6 @@ if uploaded_file:
 else:
     st.info("👈 请在左侧上传 CSV 文件开始分析。示例数据需包含 pm25, temperature, humidity, disease_rate 列。")
     
-    # 生成示例数据按钮
     if st.button("生成示例数据"):
         np.random.seed(42)
         n = 100
@@ -522,7 +703,7 @@ else:
             'pm25': np.random.normal(50, 20, n),
             'temperature': np.random.normal(20, 5, n),
             'humidity': np.random.normal(60, 10, n),
-            'disease_rate': np.random.normal(10, 2, n) + np.random.normal(0, 0.1, n) * np.random.normal(50, 20, n) # 构造一点相关性
+            'disease_rate': np.random.normal(10, 2, n) + np.random.normal(0, 0.1, n) * np.random.normal(50, 20, n)
         })
         demo_df['disease_rate'] = demo_df['disease_rate'].clip(0)
         csv = demo_df.to_csv(index=False).encode('utf-8-sig')
